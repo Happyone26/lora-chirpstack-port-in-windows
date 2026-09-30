@@ -1,0 +1,11 @@
+{
+  "name": "chirpstack-mqtt-stats-exporter",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "dependencies": {
+    "mqtt": "^5.10.1",
+    "prom-client": "^15.1.3"
+  }
+}
