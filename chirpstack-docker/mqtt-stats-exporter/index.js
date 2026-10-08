@@ -15,10 +15,10 @@ const CSV_PATH = process.env.CSV_PATH || "/data/uplinks.csv";
 const ACTIVE_WINDOW_MS = Number(process.env.LORA_ACTIVE_WINDOW_SEC || 300) * 1000;
 // Number of frequency channels devices hop across (AU915 au915_0 = 8x125kHz
 // channels). Two transmissions only actually collide if they land on the same
-// channel AND overlap in time - the Pure ALOHA formula below only models the
-// time-overlap part, so its result is divided by this to approximate the
-// channel-hop effect (P(same channel) ~= 1/CHANNEL_COUNT for uniform random
-// channel selection). Adjust if the sub-band/channel plan changes.
+// channel AND overlap in time - with uniform random channel hopping each channel
+// is its own ALOHA system carrying 1/CHANNEL_COUNT of the offered load, so the
+// load G is divided by this before applying the Pure ALOHA formula below.
+// Adjust if the sub-band/channel plan changes.
 const CHANNEL_COUNT = Number(process.env.LORA_CHANNEL_COUNT || 8);
 // A device stops counting toward metrics after ACTIVE_WINDOW_MS, but its
 // tracking-map entries (csvStatsByDevice, deviceNameById, deviceGatewayById,
@@ -28,10 +28,18 @@ const CHANNEL_COUNT = Number(process.env.LORA_CHANNEL_COUNT || 8);
 // entirely rather than just excluding it from calculations.
 const MAP_TTL_MS = Number(process.env.LORA_MAP_TTL_SEC || 3600) * 1000;
 
+// Campaign step label written into every CSV row: the measurement sequencer (or
+// the user, by hand) writes the current step name into this file next to the
+// CSV; empty/missing file = no step.
+const STEP_FILE_PATH = path.join(path.dirname(CSV_PATH), "current_step");
+
+// Raw per-uplink data for offline analysis (tools/analyze_collisions.py):
+// frequency_hz + tmst_us + toa_ms let packets that overlapped on the same
+// channel be found after the fact, and fcnt_gap gives per-step PDR directly.
 const CSV_COLUMNS = [
-  "timestamp", "device_name", "f_cnt", "confirmed", "data_len",
-  "rssi_dbm", "snr_db", "gateway_count", "pdr_percent", "throughput_bps",
-  "sf", "toa_ms", "active_devices", "collision_rate_percent",
+  "timestamp", "dev_eui", "device_name", "step", "f_cnt", "fcnt_gap", "confirmed", "data_len",
+  "rssi_dbm", "snr_db", "gateway_id", "gateway_count", "frequency_hz", "tmst_us",
+  "sf", "toa_ms", "pdr_percent", "throughput_bps", "active_devices", "aloha_ref_percent",
 ];
 
 function csvEscape(value) {
@@ -58,15 +66,46 @@ function computeTimeOnAirMs(sf, bwHz, codeRate, phyPayloadLen) {
 }
 
 fs.mkdirSync(path.dirname(CSV_PATH), { recursive: true });
+// If the CSV was written with a different column layout (older exporter
+// version), set it aside instead of appending rows that don't match its header.
+if (fs.existsSync(CSV_PATH)) {
+  const header = fs.readFileSync(CSV_PATH, "utf8").split("\n", 1)[0];
+  if (header !== CSV_COLUMNS.join(",")) {
+    const legacyPath = CSV_PATH.replace(/\.csv$/, "") + `_legacy_${new Date().toISOString().replace(/[:.]/g, "-")}.csv`;
+    fs.renameSync(CSV_PATH, legacyPath);
+    console.log(`CSV header changed - previous file moved to ${legacyPath}`);
+  }
+}
 if (!fs.existsSync(CSV_PATH)) {
   fs.writeFileSync(CSV_PATH, CSV_COLUMNS.join(",") + "\n");
 }
 
+function readCurrentStep() {
+  try {
+    return fs.readFileSync(STEP_FILE_PATH, "utf8").trim();
+  } catch {
+    return "";
+  }
+}
+
+// The Semtech UDP gateway bridge puts the concentrator's internal counter
+// (tmst, microseconds, wraps every ~71.6 min) into rxInfo.context as 4 bytes
+// big-endian. Precise enough to tell whether two packets overlapped on air.
+function decodeTmstUs(rx) {
+  if (!rx?.context) return undefined;
+  const buf = Buffer.from(rx.context, "base64");
+  return buf.length >= 4 ? buf.readUInt32BE(0) : undefined;
+}
+
+// One long-lived append stream, so rows are written strictly one after another.
+// Separate concurrent fs.appendFile calls (two uplinks arriving within ms of each
+// other) overwrote each other on the Windows-backed bind mount - the 2026-10-07
+// reading lost ~700 rows that way, which would show up as fake FCnt gaps.
+const csvStream = fs.createWriteStream(CSV_PATH, { flags: "a" });
+csvStream.on("error", err => console.error("failed to append CSV row:", err.message));
+
 function appendUplinkCsv(row) {
-  const line = CSV_COLUMNS.map(col => csvEscape(row[col])).join(",") + "\n";
-  fs.appendFile(CSV_PATH, line, err => {
-    if (err) console.error("failed to append CSV row:", err.message);
-  });
+  csvStream.write(CSV_COLUMNS.map(col => csvEscape(row[col])).join(",") + "\n");
 }
 
 const register = new client.Registry();
@@ -155,7 +194,7 @@ const deviceLastSeen = new client.Gauge({
 });
 const deviceCollisionRatePercent = new client.Gauge({
   name: "chirpstack_device_collision_rate_percent",
-  help: "Pure ALOHA collision probability estimate for the device's last uplink (see CSV export for methodology)",
+  help: "Pure ALOHA reference collision probability (per channel, same-SF devices only) for the device's last uplink",
   labelNames: deviceLabelNames,
   registers: [register],
 });
@@ -244,6 +283,9 @@ function handleUplink(topic, payload) {
   const lastFcntSeen = lastFcntByDevice.get(deviceId);
   const isRetry = fCnt !== null && lastFcntSeen !== undefined && fCnt === lastFcntSeen;
   const isRejoin = fCnt !== null && lastFcntSeen !== undefined && fCnt < lastFcntSeen;
+  // Frames the device sent since its previous received uplink that never arrived.
+  const fcntGap = fCnt !== null && !isRetry && !isRejoin && lastFcntSeen !== undefined && fCnt > lastFcntSeen
+    ? fCnt - lastFcntSeen - 1 : 0;
 
   for (const rx of rxInfo) {
     if (!rx.gatewayId) continue;
@@ -264,8 +306,7 @@ function handleUplink(topic, payload) {
   if (fCnt !== null && !isRetry) {
     // always touch the counter (even by 0) so the series exists from the first
     // uplink onward - otherwise the PDR panel shows "No data" until a gap ever happens
-    const gap = !isRejoin && lastFcntSeen !== undefined && fCnt > lastFcntSeen ? fCnt - lastFcntSeen - 1 : 0;
-    deviceFcntGapTotal.inc(deviceLabels, Math.max(gap, 0));
+    deviceFcntGapTotal.inc(deviceLabels, fcntGap);
     lastFcntByDevice.set(deviceId, fCnt);
     deviceLastFcnt.set(deviceLabels, fCnt);
   }
@@ -313,10 +354,7 @@ function handleUplink(topic, payload) {
     csvState.framesTotal = 0;
     csvState.gapsTotal = 0;
   }
-  if (fCnt !== null && !isRetry) {
-    const gap = !isRejoin && lastFcntSeen !== undefined && fCnt > lastFcntSeen ? fCnt - lastFcntSeen - 1 : 0;
-    csvState.gapsTotal += Math.max(gap, 0);
-  }
+  csvState.gapsTotal += fcntGap;
   if (!isRetry) {
     csvState.framesTotal += 1;
   }
@@ -324,53 +362,65 @@ function handleUplink(topic, payload) {
   const pdrPercent = pdrDenom > 0 ? ((100 * csvState.framesTotal) / pdrDenom).toFixed(1) : "";
   const elapsedSec = csvState.lastTsMs !== undefined ? (nowMs - csvState.lastTsMs) / 1000 : undefined;
   const throughputBps = elapsedSec !== undefined && elapsedSec > 0 ? (dataBuf.length / elapsedSec).toFixed(2) : "";
-  if (elapsedSec !== undefined && elapsedSec > 0) {
-    csvState.lambdaPerSec = 1 / elapsedSec;
+  // Transmission rate λ (frames/sec) measured from FCnt progress rather than
+  // 1/interval-between-received-packets: a lost packet would otherwise halve
+  // the measured rate exactly when the channel is busiest. Anchored on new
+  // frames only (a confirmed retry repeats the FCnt); a rejoin restarts it.
+  if (fCnt !== null && !isRetry) {
+    if (!isRejoin && csvState.lambdaRefFcnt !== undefined && nowMs > csvState.lambdaRefTsMs) {
+      csvState.lambdaPerSec = (fCnt - csvState.lambdaRefFcnt) / ((nowMs - csvState.lambdaRefTsMs) / 1000);
+    }
+    csvState.lambdaRefFcnt = fCnt;
+    csvState.lambdaRefTsMs = nowMs;
   }
   csvState.lastTsMs = nowMs;
+  csvState.lastSf = sf;
 
-  // Pure ALOHA collision probability estimate: P = (1 - e^(-2G)) / CHANNEL_COUNT,
-  // G = sum of the OTHER active devices' observed transmission rates (packets/sec)
-  // times this packet's ToA - a packet can't collide with itself, so this
-  // device's own rate is excluded, and each device's *actual* measured rate is
-  // used instead of assuming every device transmits like this one. The result
-  // is divided by CHANNEL_COUNT because 1-e^(-2G) only models time overlap;
-  // an actual collision also requires landing on the same frequency channel.
-  // With no other active device, G is 0 and the result is naturally 0 - no
-  // special case needed.
+  // Theoretical reference only - the measured collision loss comes from
+  // comparing per-step PDR offline (tools/analyze_collisions.py).
+  // Standard Pure ALOHA applied per channel and per SF: P = 1 - e^(-2G), with
+  // G = sum of the OTHER active same-SF devices' rates x ToA / CHANNEL_COUNT.
+  // Each of the CHANNEL_COUNT channels is its own ALOHA system (devices hop
+  // uniformly), and different SFs are treated as orthogonal, so with equal
+  // payloads every packet counted here has this packet's ToA. With no other
+  // active same-SF device, G is 0 and P is naturally 0.
   const activeDeviceCount = countActiveDevices(nowMs);
-  let collisionRatePercent = "";
-  if (elapsedSec !== undefined && elapsedSec > 0 && toaMs !== undefined) {
+  let alohaRefPercent = "";
+  if (toaMs !== undefined) {
     let othersLambdaSum = 0;
     for (const [otherId, otherState] of csvStatsByDevice) {
-      if (otherId === deviceId) continue;
+      if (otherId === deviceId || otherState.lastSf !== sf) continue;
       if (otherState.lastTsMs === undefined || nowMs - otherState.lastTsMs > ACTIVE_WINDOW_MS) continue;
       if (otherState.lambdaPerSec !== undefined) othersLambdaSum += otherState.lambdaPerSec;
     }
-    const g = othersLambdaSum * (toaMs / 1000);
-    collisionRatePercent = ((100 * (1 - Math.exp(-2 * g))) / CHANNEL_COUNT).toFixed(2);
-  }
-  if (collisionRatePercent !== "") {
-    deviceCollisionRatePercent.set(deviceLabels, Number(collisionRatePercent));
+    const g = (othersLambdaSum * (toaMs / 1000)) / CHANNEL_COUNT;
+    alohaRefPercent = (100 * (1 - Math.exp(-2 * g))).toFixed(2);
+    deviceCollisionRatePercent.set(deviceLabels, Number(alohaRefPercent));
   }
   activeDevicesGauge.set(activeDeviceCount);
 
   // One CSV row per uplink, persisted to a host-mounted volume for offline analysis.
   appendUplinkCsv({
     timestamp: ts,
+    dev_eui: deviceId,
     device_name: deviceName,
+    step: readCurrentStep(),
     f_cnt: fCnt,
+    fcnt_gap: fcntGap,
     confirmed: up.confirmed ?? "",
     data_len: dataBuf.length,
     rssi_dbm: bestRx?.rssi ?? "",
     snr_db: bestRx?.snr ?? "",
+    gateway_id: bestRx?.gatewayId ?? "",
     gateway_count: rxInfo.length,
-    pdr_percent: pdrPercent,
-    throughput_bps: throughputBps,
+    frequency_hz: up.txInfo?.frequency ?? "",
+    tmst_us: decodeTmstUs(bestRx) ?? "",
     sf: sf ?? "",
     toa_ms: toaMs !== undefined ? toaMs.toFixed(1) : "",
+    pdr_percent: pdrPercent,
+    throughput_bps: throughputBps,
     active_devices: activeDeviceCount,
-    collision_rate_percent: collisionRatePercent,
+    aloha_ref_percent: alohaRefPercent,
   });
 }
 
