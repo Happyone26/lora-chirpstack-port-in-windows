@@ -20,6 +20,17 @@ const ACTIVE_WINDOW_MS = Number(process.env.LORA_ACTIVE_WINDOW_SEC || 300) * 100
 // load G is divided by this before applying the Pure ALOHA formula below.
 // Adjust if the sub-band/channel plan changes.
 const CHANNEL_COUNT = Number(process.env.LORA_CHANNEL_COUNT || 8);
+// Measurement frames use this fPort; anything else (the firmware's standby
+// polls on fPort 3) only keeps a device reachable for downlink commands.
+const DATA_FPORT = Number(process.env.LORA_DATA_FPORT || 2);
+// A device with no frame at all (data or standby poll) for this long is shown
+// as offline: its status series are removed. Standby polls come every ~10 s.
+const OFFLINE_MS = Number(process.env.LORA_OFFLINE_SEC || 45) * 1000;
+// Battery info sent by the firmware: the 1-byte measurement payload is the battery
+// level 0..100 %, or BATTERY_BYTE_USB when powered by USB (older firmware sent 0xAA,
+// which matches neither and is ignored); standby polls carry mV (2 bytes BE), % and
+// flags (bit0 = USB).
+const BATTERY_BYTE_USB = 101;
 // A device stops counting toward metrics after ACTIVE_WINDOW_MS, but its
 // tracking-map entries (csvStatsByDevice, deviceNameById, deviceGatewayById,
 // lastFcntByDevice) stuck around forever until now - every distinct DevEUI
@@ -38,8 +49,9 @@ const STEP_FILE_PATH = path.join(path.dirname(CSV_PATH), "current_step");
 // channel be found after the fact, and fcnt_gap gives per-step PDR directly.
 const CSV_COLUMNS = [
   "timestamp", "dev_eui", "device_name", "step", "f_cnt", "fcnt_gap", "confirmed", "data_len",
-  "rssi_dbm", "snr_db", "gateway_id", "gateway_count", "frequency_hz", "tmst_us",
+  "rssi_dbm", "snr_db", "gateway_id", "gateway_count", "frequency_hz", "channel", "tmst_us",
   "sf", "toa_ms", "pdr_percent", "throughput_bps", "active_devices", "aloha_ref_percent",
+  "battery_percent", "usb_powered", "tx_power_index",
 ];
 
 function csvEscape(value) {
@@ -78,6 +90,18 @@ if (fs.existsSync(CSV_PATH)) {
 }
 if (!fs.existsSync(CSV_PATH)) {
   fs.writeFileSync(CSV_PATH, CSV_COLUMNS.join(",") + "\n");
+}
+
+// LoRaWAN AU915 uplink channel number from frequency + bandwidth (RP002): 125 kHz
+// channels 0..63 start at 915.2 MHz every 200 kHz, 500 kHz channels 64..71 start at
+// 915.9 MHz every 1.6 MHz. Empty if the frequency isn't on that plan.
+function au915Channel(frequencyHz, bandwidthHz) {
+  if (!frequencyHz) return "";
+  const [base, step, first, count] = bandwidthHz === 500000
+    ? [915900000, 1600000, 64, 8] : [915200000, 200000, 0, 64];
+  const offset = frequencyHz - base;
+  const index = offset / step;
+  return offset >= 0 && Number.isInteger(index) && index < count ? first + index : "";
 }
 
 function readCurrentStep() {
@@ -198,6 +222,71 @@ const deviceCollisionRatePercent = new client.Gauge({
   labelNames: deviceLabelNames,
   registers: [register],
 });
+// Device status, fed by EVERY frame (data and standby polls) and kept apart from
+// the measurement metrics above, so devices in standby still show up in Grafana.
+const deviceMode = new client.Gauge({
+  name: "chirpstack_device_mode",
+  help: "1 = medindo (dados na porta de dados), 0 = standby (so consultas); some quando o device fica offline",
+  labelNames: deviceLabelNames,
+  registers: [register],
+});
+const deviceCurrentSf = new client.Gauge({
+  name: "chirpstack_device_current_sf",
+  help: "Spreading factor do ultimo frame recebido do device (dados ou consulta de standby)",
+  labelNames: deviceLabelNames,
+  registers: [register],
+});
+const deviceLastFrameTs = new client.Gauge({
+  name: "chirpstack_device_last_frame_timestamp_seconds",
+  help: "Unix timestamp do ultimo frame recebido do device (dados ou consulta de standby)",
+  labelNames: deviceLabelNames,
+  registers: [register],
+});
+const deviceLastFrameRssi = new client.Gauge({
+  name: "chirpstack_device_last_frame_rssi_dbm",
+  help: "RSSI (dBm) do ultimo frame recebido do device, no gateway que melhor o recebeu",
+  labelNames: deviceLabelNames,
+  registers: [register],
+});
+const deviceLastFrameSnr = new client.Gauge({
+  name: "chirpstack_device_last_frame_snr_db",
+  help: "SNR (dB) do ultimo frame recebido do device, no gateway que melhor o recebeu",
+  labelNames: deviceLabelNames,
+  registers: [register],
+});
+const deviceBatteryMv = new client.Gauge({
+  name: "chirpstack_device_battery_mv",
+  help: "Tensao da bateria (mV) informada na ultima consulta de standby",
+  labelNames: deviceLabelNames,
+  registers: [register],
+});
+const deviceBatteryPercent = new client.Gauge({
+  name: "chirpstack_device_battery_percent",
+  help: "Nivel da bateria (%) informado pelo device (dados ou consulta de standby)",
+  labelNames: deviceLabelNames,
+  registers: [register],
+});
+const deviceUsbPowered = new client.Gauge({
+  name: "chirpstack_device_usb_powered",
+  help: "1 = device alimentado por USB, 0 = na bateria",
+  labelNames: deviceLabelNames,
+  registers: [register],
+});
+const deviceTxPowerIndex = new client.Gauge({
+  name: "chirpstack_device_tx_power_index",
+  help: "Indice TX_POWER em uso (0..14; AU915: 30 - 2*indice - 2,15 dBm, max. 22 dBm), informado na consulta de standby",
+  labelNames: deviceLabelNames,
+  registers: [register],
+});
+const deviceTxPowerSweepLevels = new client.Gauge({
+  name: "chirpstack_device_tx_power_sweep_levels",
+  help: "Niveis na varredura de potencia ativa (0 = potencia fixa), informado na consulta de standby",
+  labelNames: deviceLabelNames,
+  registers: [register],
+});
+const deviceStatusGauges = [deviceMode, deviceCurrentSf, deviceLastFrameTs, deviceLastFrameRssi, deviceLastFrameSnr,
+  deviceBatteryMv, deviceBatteryPercent, deviceUsbPowered, deviceTxPowerIndex, deviceTxPowerSweepLevels];
+
 const activeDevicesGauge = new client.Gauge({
   name: "chirpstack_active_devices",
   help: "Number of devices with an uplink inside the collision estimate's active window",
@@ -219,6 +308,52 @@ const deviceGatewayById = new Map();
 // throughput columns (kept separate from the Prometheus counters above so the
 // Grafana panels are unaffected by this book-keeping).
 const csvStatsByDevice = new Map();
+
+// device_ids whose most recent received frame was a standby poll: frames lost
+// right after it can't be told apart from lost polls, so that first gap is not
+// counted against the measurement PDR.
+const lastFrameWasPoll = new Set();
+
+// device_id -> { labels, lastMs } of the last frame of any kind, for the
+// device-status gauges and their offline sweep.
+const deviceStatusById = new Map();
+
+function updateDeviceStatus(deviceId, deviceLabels, up, rxInfo) {
+  const best = rxInfo.reduce((b, rx) => (b === null || (rx.rssi ?? -Infinity) > (b.rssi ?? -Infinity) ? rx : b), null);
+  const sf = up.txInfo?.modulation?.lora?.spreadingFactor;
+  deviceMode.set(deviceLabels, up.fPort === DATA_FPORT ? 1 : 0);
+  if (sf) deviceCurrentSf.set(deviceLabels, sf);
+  deviceLastFrameTs.set(deviceLabels, Date.now() / 1000);
+  if (typeof best?.rssi === "number") deviceLastFrameRssi.set(deviceLabels, best.rssi);
+  if (typeof best?.snr === "number") deviceLastFrameSnr.set(deviceLabels, best.snr);
+  deviceStatusById.set(deviceId, { labels: deviceLabels, lastMs: Date.now() });
+
+  const payload = Buffer.from(up.data || "", "base64");
+  // Measurement frames: byte0 = battery (see BATTERY_BYTE_USB); a 2nd byte, present
+  // only while TX power control is in use, is the TX_POWER index of this very frame.
+  const battery = { percent: "", usb: "", txp: "" };
+  if (up.fPort === DATA_FPORT && payload.length >= 2) {
+    battery.txp = payload[1];
+    deviceTxPowerIndex.set(deviceLabels, payload[1]);
+  }
+  if (up.fPort === DATA_FPORT && (payload.length === 1 || payload.length === 2)) {
+    if (payload[0] <= 100) {
+      battery.percent = payload[0];
+      battery.usb = 0;
+    } else if (payload[0] === BATTERY_BYTE_USB) {
+      battery.usb = 1;
+    }
+  } else if (up.fPort !== DATA_FPORT && payload.length >= 4) {
+    deviceBatteryMv.set(deviceLabels, payload.readUInt16BE(0));
+    battery.percent = payload[2];
+    battery.usb = payload[3] & 1;
+    if (payload.length >= 5) deviceTxPowerIndex.set(deviceLabels, payload[4]);
+    if (payload.length >= 6) deviceTxPowerSweepLevels.set(deviceLabels, payload[5]);
+  }
+  if (battery.percent !== "") deviceBatteryPercent.set(deviceLabels, battery.percent);
+  if (battery.usb !== "") deviceUsbPowered.set(deviceLabels, battery.usb);
+  return battery;
+}
 
 // Number of devices with an uplink inside the last ACTIVE_WINDOW_MS - used as N
 // in the Pure ALOHA collision estimate, so it grows automatically as devices join.
@@ -284,8 +419,21 @@ function handleUplink(topic, payload) {
   const isRetry = fCnt !== null && lastFcntSeen !== undefined && fCnt === lastFcntSeen;
   const isRejoin = fCnt !== null && lastFcntSeen !== undefined && fCnt < lastFcntSeen;
   // Frames the device sent since its previous received uplink that never arrived.
-  const fcntGap = fCnt !== null && !isRetry && !isRejoin && lastFcntSeen !== undefined && fCnt > lastFcntSeen
+  let fcntGap = fCnt !== null && !isRetry && !isRejoin && lastFcntSeen !== undefined && fCnt > lastFcntSeen
     ? fCnt - lastFcntSeen - 1 : 0;
+
+  const battery = updateDeviceStatus(deviceId, deviceLabels, up, rxInfo);
+
+  // Standby polls advance FCnt (so the next data frame's gap stays correct) but
+  // stay out of PDR, transmission rate, active-device count and the CSV.
+  if (up.fPort !== DATA_FPORT) {
+    if (fCnt !== null && !isRetry) lastFcntByDevice.set(deviceId, fCnt);
+    lastFrameWasPoll.add(deviceId);
+    console.log(JSON.stringify({ ts: new Date().toISOString(), event: "standby_poll", device_id: deviceId,
+      device_name: deviceName, f_cnt: fCnt, f_port: up.fPort ?? null, sf: up.txInfo?.modulation?.lora?.spreadingFactor ?? null }));
+    return;
+  }
+  if (lastFrameWasPoll.delete(deviceId)) fcntGap = 0;
 
   for (const rx of rxInfo) {
     if (!rx.gatewayId) continue;
@@ -414,6 +562,7 @@ function handleUplink(topic, payload) {
     gateway_id: bestRx?.gatewayId ?? "",
     gateway_count: rxInfo.length,
     frequency_hz: up.txInfo?.frequency ?? "",
+    channel: au915Channel(up.txInfo?.frequency, lora?.bandwidth),
     tmst_us: decodeTmstUs(bestRx) ?? "",
     sf: sf ?? "",
     toa_ms: toaMs !== undefined ? toaMs.toFixed(1) : "",
@@ -421,6 +570,9 @@ function handleUplink(topic, payload) {
     throughput_bps: throughputBps,
     active_devices: activeDeviceCount,
     aloha_ref_percent: alohaRefPercent,
+    battery_percent: battery.percent,
+    usb_powered: battery.usb,
+    tx_power_index: battery.txp,
   });
 }
 
@@ -461,6 +613,13 @@ setInterval(() => {
       deviceNameById.delete(devId);
       deviceGatewayById.delete(devId);
       lastFcntByDevice.delete(devId);
+      lastFrameWasPoll.delete(devId);
+    }
+  }
+  for (const [devId, status] of deviceStatusById) {
+    if (nowMs - status.lastMs > OFFLINE_MS) {
+      for (const g of deviceStatusGauges) g.remove(status.labels);
+      deviceStatusById.delete(devId);
     }
   }
   // activeDevicesGauge is otherwise only updated as a side effect of processing

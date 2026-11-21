@@ -27,4 +27,6 @@ schema_config:
 
 limits_config:
   allow_structured_metadata: false
-  retention_period: 168h
+  # Same horizon as Prometheus (365d), so uplink logs of past readings stay
+  # visible. Only enforced if the compactor has retention_enabled.
+  retention_period: 8760h

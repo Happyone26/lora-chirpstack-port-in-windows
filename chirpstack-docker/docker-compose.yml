@@ -83,9 +83,10 @@ services:
     environment:
       - MQTT_URL=mqtt://mosquitto:1883
       - CSV_PATH=/data/uplinks.csv
-      # A device counts toward the CSV's collision-rate estimate's N if it sent
-      # an uplink within this many seconds (i.e. currently contending for the channel).
-      - LORA_ACTIVE_WINDOW_SEC=20
+      # A device counts as active (Devices ativos panel, ALOHA reference) if it sent
+      # a data uplink within this many seconds: ~2 sends at 5 s +- 0.5 s, so the previous
+      # ED stops counting right after a hand-over between campaign steps.
+      - LORA_ACTIVE_WINDOW_SEC=12
     volumes:
       - ./data/uplinks:/data
     depends_on:
@@ -100,6 +101,9 @@ services:
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus
+      # Keep campaign readings browsable in Grafana for the whole project
+      # (default is 15d, which silently dropped older readings).
+      - --storage.tsdb.retention.time=365d
       - --query.lookback-delta=30s
     volumes:
       - ./configuration/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
