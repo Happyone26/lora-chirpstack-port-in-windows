@@ -87,17 +87,26 @@ def main():
         if r.get("step", "").startswith("P_") and r.get("f_cnt"):
             by_step_dev[(r["step"], r["device_name"], r["sf"])][int(r["f_cnt"])] = r
 
+    # Perdidos: pelo fcnt_gap do exporter, que só conta buraco entre dois pacotes de DADOS (fica 0
+    # depois de consultas de standby ou de um reinício do exporter) — assim uma etapa pausada e
+    # retomada não conta as consultas da pausa como perdas. CSV sem fcnt_gap: buracos entre recebidos.
+    has_gap_col = any(r.get("fcnt_gap", "") != "" for fr in by_step_dev.values() for r in fr.values())
     levels = defaultdict(lambda: {"sent": 0, "rx": 0, "rssi": [], "snr": []})  # (ed, sf, idx)
     mismatches = 0
     for (step, ed, sf), frames in by_step_dev.items():
         sweep = step_sweep.get(step, default_sweep)
-        for f in range(min(frames), max(frames) + 1):
+        received = sorted(frames)
+        lost = []
+        for prev, f in zip(received, received[1:]):
+            gap = int(frames[f].get("fcnt_gap") or 0) if has_gap_col else f - prev - 1
+            lost += range(max(prev + 1, f - gap), f)
+        for f in lost:
+            levels[(ed, sf, sweep[f % len(sweep)])]["sent"] += 1
+        for f in received:
             idx = sweep[f % len(sweep)]
             g = levels[(ed, sf, idx)]
             g["sent"] += 1
-            r = frames.get(f)
-            if r is None:
-                continue
+            r = frames[f]
             g["rx"] += 1
             if r.get("tx_power_index", "") not in ("", str(idx)):
                 mismatches += 1  # o pacote declarou outro índice: varredura desalinhada
